@@ -70,24 +70,6 @@ impl LocalLlmSession {
     }
 }
 
-fn user_turn(text: &str) -> String {
-    format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
-}
-
-fn tool_response_turn(results: &[(String, bool)]) -> String {
-    let mut out = String::from("<|im_start|>user\n");
-    for (result, is_error) in results {
-        out.push_str("<tool_response>\n");
-        if *is_error {
-            out.push_str("ERROR: ");
-        }
-        out.push_str(result);
-        out.push_str("\n</tool_response>\n");
-    }
-    out.push_str("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
-    out
-}
-
 /// Hold leading whitespace until the turn has proved it has visible content.
 /// Once the first non-whitespace fragment arrives, streaming is immediate.
 #[derive(Default)]
