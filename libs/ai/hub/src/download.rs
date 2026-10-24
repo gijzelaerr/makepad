@@ -581,7 +581,30 @@ fn process_exists(pid: u32) -> bool {
     alive || std::io::Error::last_os_error().raw_os_error() != Some(3)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    use makepad_windows_sys::Win32::Foundation::CloseHandle;
+    use makepad_windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // ERROR_INVALID_PARAMETER: no process has this id. Any other failure
+    // (access denied for another user's process) counts as alive.
+    const NO_SUCH_PROCESS: i32 = 0x8007_0057u32 as i32;
+    const STILL_ACTIVE: u32 = 259;
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            let mut code = STILL_ACTIVE;
+            let queried = unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok();
+            let _ = unsafe { CloseHandle(handle) };
+            // A killed process whose handle someone still holds opens
+            // fine but reports its exit code.
+            !queried || code == STILL_ACTIVE
+        }
+        Err(error) => error.0 != NO_SUCH_PROCESS,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_exists(_pid: u32) -> bool {
     true
 }
