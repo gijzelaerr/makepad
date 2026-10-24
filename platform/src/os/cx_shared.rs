@@ -2587,6 +2587,44 @@ mod hosted_demand {
     }
 }
 
+impl Cx {
+    /// Dispatches the Win32 messages of windows the app's own thread created:
+    /// a VST3 or CLAP plugin editor, a window from another toolkit or SDK.
+    ///
+    /// On Windows a window's messages go to the thread that created it.
+    /// Makepad's Win32 message loop runs on the process main thread, which the
+    /// HAL owns, and the app runs on a thread of its own that never reads a
+    /// message queue. So a window the app creates may paint, but it never
+    /// gets its input, timers or posted messages. While such a window is open,
+    /// call this often, for example from a ~16 ms interval timer. It drains
+    /// only the calling thread's queue (Makepad's own windows live on the main
+    /// thread and are untouched), at most 256 messages a call so a window that
+    /// floods its queue cannot hold the app thread. Returns how many messages
+    /// it dispatched. On other platforms it does nothing and returns 0.
+    pub fn pump_foreign_window_messages(&self) -> usize {
+        #[cfg(windows)]
+        {
+            use crate::windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+            let mut msg = MSG::default();
+            let mut dispatched = 0;
+            while dispatched < 256 {
+                // SAFETY: plain Win32 calls on a stack MSG, for this thread's own queue.
+                unsafe {
+                    if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        break;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                dispatched += 1;
+            }
+            dispatched
+        }
+        #[cfg(not(windows))]
+        0
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl Cx {
     /// Wake a hosted child on worker signals. Socket-read loops ask the host for a
