@@ -203,6 +203,59 @@ impl AiServicePort {
         out
     }
 
+    /// A call against the manifest: the tool exists, its arguments are an
+    /// object, every required argument is there, and a schema with
+    /// `additionalProperties: false` gets no key it does not declare. Every
+    /// caller (the chat engine, `makepad-remote app call`, MCP, a direct
+    /// `call_remote`) reaches the app through here, so a call with a
+    /// misspelled or missing argument is refused with its reasons instead of
+    /// reaching the app's match and silently doing nothing. Value types stay
+    /// the app's business: local models send numbers as text, and apps read
+    /// `"7"` as 7 on purpose. `Err` is the refusal.
+    fn check_call(&self, call: &ServiceCall) -> Result<(), String> {
+        use makepad_strict_json::Value;
+        let Some(def) = self.manifest.tool(&call.tool) else {
+            let names: Vec<&str> = self.manifest.tools.iter().map(|t| t.name.as_str()).collect();
+            return Err(format!("no tool `{}` (the tools are: {})", call.tool, names.join(", ")));
+        };
+        let Ok(schema) = makepad_strict_json::parse(def.parameters.as_bytes()) else {
+            // The manifest validated; a schema this parser cannot read is not
+            // the caller's fault, so the app decides.
+            return Ok(());
+        };
+        let args = if call.args.trim().is_empty() {
+            Value::Obj(Vec::new())
+        } else {
+            makepad_strict_json::parse(call.args.as_bytes())
+                .map_err(|e| format!("the arguments of `{}` are not JSON: {e}", call.tool))?
+        };
+        let Value::Obj(fields) = &args else {
+            return Err(format!("the arguments of `{}` must be a JSON object", call.tool));
+        };
+        let declared: Vec<&str> = match schema.get("properties") {
+            Some(Value::Obj(properties)) => properties.iter().map(|(name, _)| name.as_str()).collect(),
+            _ => Vec::new(),
+        };
+        let mut why = Vec::new();
+        for name in schema.get("required").and_then(Value::as_arr).unwrap_or(&[]).iter().filter_map(Value::as_str) {
+            if !fields.iter().any(|(key, _)| key == name) {
+                why.push(format!("`{name}` is required"));
+            }
+        }
+        if matches!(schema.get("additionalProperties"), Some(Value::Bool(false))) {
+            for (key, _) in fields {
+                if !declared.contains(&key.as_str()) {
+                    why.push(format!("`{key}` is not an argument of this tool"));
+                }
+            }
+        }
+        if why.is_empty() {
+            return Ok(());
+        }
+        let known = if declared.is_empty() { "none".to_string() } else { declared.join(", ") };
+        Err(format!("bad arguments for `{}`: {} (its arguments are: {known})", call.tool, why.join("; ")))
+    }
+
     /// One frame through the address filter.
     fn accept(&mut self, frame: HostedDown) -> Option<PortEvent> {
         frame.msg.validate().ok()?;
@@ -224,7 +277,13 @@ impl AiServicePort {
                 }
                 Some(match msg {
                     ServiceDown::Registered { .. } => unreachable!(),
-                    ServiceDown::Call(call) => PortEvent::Call(call),
+                    ServiceDown::Call(call) => {
+                        if let Err(why) = self.check_call(&call) {
+                            self.reply(ToolResult::refused(&call.call_id, why));
+                            return None;
+                        }
+                        PortEvent::Call(call)
+                    }
                     ServiceDown::Cancel { call_id } => PortEvent::Cancel { call_id },
                     ServiceDown::Subscribe { sub_id, topic, filter } => {
                         PortEvent::Subscribe { sub_id, topic, filter }
@@ -365,7 +424,7 @@ mod tests {
         link.down.send(HostedDown { to: Some(ep("other")), msg: ServiceDown::Call(ServiceCall { call_id: "c0".into(), tool: "stat".into(), args: "{}".into(), caller: None }) }).unwrap();
         link.down.send(HostedDown { to: None, msg: ServiceDown::Registered { port_tag: tag + 100, endpoint: ep("not-me") } }).unwrap();
         link.down.send(HostedDown { to: None, msg: ServiceDown::Registered { port_tag: tag, endpoint: ep("e1") } }).unwrap();
-        link.down.send(HostedDown { to: Some(ep("e1")), msg: ServiceDown::Call(ServiceCall { call_id: "c1".into(), tool: "stat".into(), args: "{}".into(), caller: None }) }).unwrap();
+        link.down.send(HostedDown { to: Some(ep("e1")), msg: ServiceDown::Call(ServiceCall { call_id: "c1".into(), tool: "stat".into(), args: r#"{"path":"~/x"}"#.into(), caller: None }) }).unwrap();
         link.down.send(HostedDown { to: Some(ep("e2")), msg: ServiceDown::Call(ServiceCall { call_id: "c2".into(), tool: "stat".into(), args: "{}".into(), caller: None }) }).unwrap();
         link.down.send(HostedDown { to: Some(ep("e1")), msg: ServiceDown::ChatOpen { open: true } }).unwrap();
         let events = pump(&mut port);
@@ -409,6 +468,85 @@ mod tests {
             ServiceUp::Result(r) => assert!(r.text.len() <= MAX_RESULT_BYTES),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A call with an unknown or missing argument never reaches the app: the
+    /// port refuses it with every reason and the names the tool takes.
+    /// (Poing's `transport` closes its schema over `play`, `seek` and `loop`;
+    /// `{"op":"play"}` used to reach it with none of them and silently do
+    /// nothing.) Value types and enums stay the app's to read.
+    #[test]
+    fn a_call_with_unknown_or_missing_arguments_is_refused_before_the_app_sees_it() {
+        let manifest = ServiceManifest::new("poing", "Poing", "A DAW.").with_tool(ToolDef::new(
+            "transport",
+            "Play, stop or seek.",
+            r#"{"type":"object","properties":{"action":{"type":"string","enum":["play","stop"]},"at":{"type":"number"}},"required":["action"],"additionalProperties":false}"#,
+            Risk::Act,
+        ));
+        let (mut port, link) = AiServicePort::in_process(manifest).unwrap();
+        let tag = match link.up.try_recv().unwrap().msg {
+            ServiceUp::Register { port_tag, .. } => port_tag,
+            other => panic!("{other:?}"),
+        };
+        link.down.send(HostedDown { to: None, msg: ServiceDown::Registered { port_tag: tag, endpoint: ep("e1") } }).unwrap();
+        let call = |id: &str, tool: &str, args: &str| HostedDown {
+            to: Some(ep("e1")),
+            msg: ServiceDown::Call(ServiceCall { call_id: id.into(), tool: tool.into(), args: args.into(), caller: None }),
+        };
+        link.down.send(call("c1", "transport", r#"{"op":"play"}"#)).unwrap();
+        link.down.send(call("c2", "transport", r#"{"action":"play","speed":2}"#)).unwrap();
+        link.down.send(call("c3", "transport", "")).unwrap();
+        link.down.send(call("c4", "mixer", "{}")).unwrap();
+        link.down.send(call("c5", "transport", "not json")).unwrap();
+        link.down.send(call("c6", "transport", r#"["play"]"#)).unwrap();
+        link.down.send(call("c7", "transport", r#"{"action":"play","at":4}"#)).unwrap();
+        // the app reads values its own way ("4" as 4, an action it does not know)
+        link.down.send(call("c8", "transport", r#"{"action":"rewind","at":"4"}"#)).unwrap();
+        let events = pump(&mut port);
+        let reached: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                PortEvent::Call(c) => Some(c.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reached, ["c7", "c8"], "{events:?}");
+
+        let refusals: Vec<ToolResult> = link
+            .up
+            .try_iter()
+            .filter_map(|f| match f.msg {
+                ServiceUp::Result(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refusals.len(), 6, "{refusals:?}");
+        assert!(refusals.iter().all(|r| r.outcome == ToolOutcome::Refused), "{refusals:?}");
+        let text = |id: &str| refusals.iter().find(|r| r.call_id == id).unwrap().text.clone();
+        assert_eq!(
+            text("c1"),
+            "bad arguments for `transport`: `action` is required; `op` is not an argument of this tool \
+             (its arguments are: action, at)"
+        );
+        assert!(text("c2").contains("`speed` is not an argument") && !text("c2").contains("required"), "{}", text("c2"));
+        assert!(text("c3").contains("`action` is required"), "{}", text("c3"));
+        assert!(text("c4").contains("no tool `mixer`") && text("c4").contains("transport"), "{}", text("c4"));
+        assert!(text("c5").contains("not JSON"), "{}", text("c5"));
+        assert!(text("c6").contains("must be a JSON object"), "{}", text("c6"));
+    }
+
+    /// An open schema (no `additionalProperties: false`) takes extra keys.
+    #[test]
+    fn an_open_schema_takes_keys_it_does_not_declare() {
+        let (mut port, link) = AiServicePort::in_process(files()).unwrap();
+        let tag = match link.up.try_recv().unwrap().msg {
+            ServiceUp::Register { port_tag, .. } => port_tag,
+            other => panic!("{other:?}"),
+        };
+        link.down.send(HostedDown { to: None, msg: ServiceDown::Registered { port_tag: tag, endpoint: ep("e1") } }).unwrap();
+        link.down.send(HostedDown { to: Some(ep("e1")), msg: ServiceDown::Call(ServiceCall { call_id: "c1".into(), tool: "stat".into(), args: r#"{"path":"~","follow":true}"#.into(), caller: None }) }).unwrap();
+        let events = pump(&mut port);
+        assert!(matches!(&events[1], PortEvent::Call(c) if c.call_id == "c1"), "{events:?}");
     }
 
     #[test]

@@ -1544,7 +1544,7 @@ mod tests {
         assert!(matches!(&port.test_drain()[0], PortEvent::Call(c) if c.tool == "export" && c.args.contains("tar")));
         assert!(model.lock().unwrap().tool_results.is_empty(), "the result is shown, not sent back");
         // A Read tool proposed runs at once, with no card; an unknown one is refused at once.
-        let read = core.propose("files", "list_dir", "", 2.0);
+        let read = core.propose("files", "list_dir", r#"{"path":"~"}"#, 2.0);
         assert!(core.state().tool(&read).unwrap().card.is_none());
         assert!(matches!(&port.test_drain()[0], PortEvent::Call(c) if c.tool == "list_dir"));
         let act = core.propose("files", "open", r#"{"path":"~"}"#, 2.0);
@@ -1722,7 +1722,7 @@ mod tests {
     #[test]
     fn progressing_calls_have_no_total_cap_and_silent_calls_can_finish() {
         let (mut core, model, mut port, _e) = setup(vec![
-            vec![call("files.list_dir", "{}"), ModelEvent::TurnDone { tool_calls: 1 }],
+            vec![call("files.list_dir", r#"{"path":"~"}"#), ModelEvent::TurnDone { tool_calls: 1 }],
         ]);
         core.send("list", 0.0);
         core.pump(0.1);
