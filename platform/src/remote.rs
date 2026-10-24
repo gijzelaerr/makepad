@@ -192,7 +192,8 @@ mod imp {
             "cap resume" => reply_to_answer(ask(|tx| Cmd::CapPause(false, tx), 4)),
             "close" => {
                 let window = p.window();
-                reply_to_answer(ask(move |tx| Cmd::Close { window, tx }, 4))
+                let force = p.flag(&["force"]);
+                reply_to_answer(ask(move |tx| Cmd::Close { window, force, tx }, 4))
             }
             // A responsive layout is checked by resizing, so the bridge can:
             // `resize w= h= [window=]` in layout points, answered after the
@@ -2598,7 +2599,7 @@ mod imp {
                 out.push_str("]}");
                 let _ = tx.send(Reply::Text(out));
             }
-            Cmd::Close { window, tx } => {
+            Cmd::Close { window, force, tx } => {
                 let window_id = match resolve_window(cx, window) {
                     Ok(window_id) => window_id,
                     Err(err) => {
@@ -2606,6 +2607,28 @@ mod imp {
                         return;
                     }
                 };
+                // Asked like the close button, so a close guard (unsaved
+                // work, a running job) can be tested — including on a hidden
+                // window (MAKEPAD_HIDE_WINDOWS), which has no OS window to
+                // send a native close to.
+                if !force {
+                    let accept_close = std::rc::Rc::new(std::cell::Cell::new(true));
+                    cx.call_event_handler(&crate::event::Event::WindowCloseRequested(crate::event::WindowCloseRequestedEvent {
+                        window_id,
+                        accept_close: accept_close.clone(),
+                    }));
+                    if !accept_close.get() {
+                        let line = format!("[makepad-remote] window {} stayed open: the app declined the close request", window_id.id());
+                        println!("{line}");
+                        let _ = std::io::stdout().flush();
+                        push_log_line(line);
+                        let _ = tx.send(Reply::Text(format!(
+                            "{{\"closed\":false,\"window\":{},\"why\":\"the app declined the close request (force=1 closes anyway)\"}}",
+                            window_id.id()
+                        )));
+                        return;
+                    }
+                }
                 let line = format!("[makepad-remote] remote closed window {}", window_id.id());
                 println!("{line}");
                 let _ = std::io::stdout().flush();
