@@ -734,6 +734,10 @@ impl Runtime {
                 )?;
                 // Bounded in-flight window: one chunk at a time.
                 check(cudaStreamSynchronize(stream), "weights upload sync")?;
+                // The device holds them now: the mapped file pages go (as
+                // the Vulkan executor does). A later host read faults them
+                // back in from the file.
+                ctx.release_ro_pages(offset, len);
                 offset += len;
                 progress(offset, ro_split);
             }
