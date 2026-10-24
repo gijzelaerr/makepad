@@ -165,6 +165,42 @@ pub fn system_text(system_prompt: &str, tools: &[ToolSpec]) -> String {
     out
 }
 
+/// What opens the assistant's turn: Qwen3.5's template with an empty
+/// thinking block, so the model answers without thinking.
+pub const ASSISTANT_OPEN: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+/// A user message on its own: `<|im_start|>user`…`<|im_end|>`. For an app
+/// that renders a whole conversation; [`user_turn`] is this plus the open.
+pub fn user_message(text: &str) -> String {
+    format!("<|im_start|>user\n{text}<|im_end|>\n")
+}
+
+/// A user turn, ending ready for the assistant's answer.
+pub fn user_turn(text: &str) -> String {
+    format!("{}{ASSISTANT_OPEN}", user_message(text))
+}
+
+/// Tool results, one `<tool_response>` block per call in call order, as one
+/// user message. `(result, is_error)`: an error is prefixed `ERROR: `.
+pub fn tool_responses(results: &[(String, bool)]) -> String {
+    let mut out = String::from("<|im_start|>user\n");
+    for (result, is_error) in results {
+        out.push_str("<tool_response>\n");
+        if *is_error {
+            out.push_str("ERROR: ");
+        }
+        out.push_str(result);
+        out.push_str("\n</tool_response>\n");
+    }
+    out.push_str("<|im_end|>\n");
+    out
+}
+
+/// [`tool_responses`], ending ready for the assistant's answer.
+pub fn tool_response_turn(results: &[(String, bool)]) -> String {
+    format!("{}{ASSISTANT_OPEN}", tool_responses(results))
+}
+
 /// A JSON string literal, appended. The only JSON this module writes.
 fn push_json_string(out: &mut String, text: &str) {
     out.push('"');
@@ -187,7 +223,7 @@ fn push_json_string(out: &mut String, text: &str) {
 /// The body between `<tool_call>` and `</tool_call>`: `<function=NAME>` and a
 /// run of `<parameter=key>\nvalue\n</parameter>`, into a name and its
 /// arguments. Values stay strings.
-pub(crate) fn parse_tool_call(body: &str) -> Result<(String, Vec<(String, String)>), String> {
+pub fn parse_tool_call(body: &str) -> Result<(String, Vec<(String, String)>), String> {
     let function_at = body.find("<function=").ok_or("missing <function=")?;
     let rest = &body[function_at + "<function=".len()..];
     let name_end = rest.find(['>', '\n']).ok_or("unterminated function name")?;
@@ -279,6 +315,41 @@ mod tests {
         assert!(prefix.contains("\"name\":\"list_dir\""));
         assert!(prefix.contains("<tools>\n"));
         assert!(prefix.ends_with("You are a file assistant.<|im_end|>\n"));
+    }
+
+    #[test]
+    fn turns_follow_the_qwen_template() {
+        assert_eq!(
+            user_turn("hi"),
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        assert_eq!(
+            tool_response_turn(&[("{}".to_string(), false), ("no such lane".to_string(), true)]),
+            "<|im_start|>user\n<tool_response>\n{}\n</tool_response>\n\
+             <tool_response>\nERROR: no such lane\n</tool_response>\n<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    /// An app that renders the whole conversation each request: messages
+    /// without the open, which comes once at the end.
+    #[test]
+    fn a_conversation_renders_from_messages() {
+        let history = [
+            user_message("a"),
+            user_message("b"),
+            format!("{ASSISTANT_OPEN}calling<|im_end|>\n"),
+            tool_responses(&[("ok".to_string(), false)]),
+            ASSISTANT_OPEN.to_string(),
+        ]
+        .concat();
+        assert_eq!(
+            history,
+            "<|im_start|>user\na<|im_end|>\n<|im_start|>user\nb<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\ncalling<|im_end|>\n\
+             <|im_start|>user\n<tool_response>\nok\n</tool_response>\n<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
     }
 
     #[test]
