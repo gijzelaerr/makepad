@@ -69,6 +69,33 @@ fn env_flag(name: &str) -> bool {
 }
 
 
+/// nvcc `-gencode` values for a `MAKEPAD_GGML_CUDA_ARCH` list: `86` or
+/// `120a` is SASS for that arch, `compute_120` is PTX for it.
+fn gencode_flags(list: &str) -> Result<Vec<String>, String> {
+    let mut flags = Vec::new();
+    for item in list.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let (ptx, arch) = match item.strip_prefix("compute_") {
+            Some(arch) => (true, arch),
+            None => (false, item.strip_prefix("sm_").unwrap_or(item)),
+        };
+        let digits = arch.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        if digits.len() < 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "MAKEPAD_GGML_CUDA_ARCH: '{item}' is not an arch (86, 120a, or compute_120 for PTX)"
+            ));
+        }
+        flags.push(if ptx {
+            format!("arch=compute_{arch},code=compute_{arch}")
+        } else {
+            format!("arch=compute_{arch},code=sm_{arch}")
+        });
+    }
+    if flags.is_empty() {
+        return Err("MAKEPAD_GGML_CUDA_ARCH is empty".to_string());
+    }
+    Ok(flags)
+}
+
 /// The compute capability of this machine's first NVIDIA GPU, in nvcc arch
 /// form ("7.5" -> "75"; Blackwell "12.0" -> "120a"), via nvidia-smi. `None`
 /// when there is no driver to ask (cross/CI builds keep the env/default).
@@ -166,10 +193,21 @@ fn build_cuda_backends(target_os: &str, require_cuda: bool) {
     // default arch is THIS machine's GPU — ask the driver. A wrong default
     // is silent sabotage: kernels for another generation compile fine and
     // then refuse to load at runtime. Env overrides for cross-builds.
+    //
+    // A comma list builds a fat binary for a release that runs on other
+    // people's GPUs: `75,80,86,89,120a,compute_120` is SASS for each of
+    // those and PTX for compute_120, which newer GPUs JIT-compile.
     let arch = env::var("MAKEPAD_GGML_CUDA_ARCH")
         .ok()
         .or_else(detect_local_arch)
         .unwrap_or_else(|| "120a".to_string());
+    let gencodes = match gencode_flags(&arch) {
+        Ok(flags) => flags,
+        Err(err) => {
+            cuda_unavailable(require_cuda, &err);
+            return;
+        }
+    };
     // The permanent record, in the build log. It lands only when this script
     // exits (cargo buffers `cargo:warning` — measured, not assumed), so it
     // cannot be the thing that reassures somebody mid-build; that is what
@@ -235,7 +273,6 @@ fn build_cuda_backends(target_os: &str, require_cuda: bool) {
             let Some((index, (src_path, obj_path))) = pending.next() else {
                 break;
             };
-            let arch_flag = format!("arch=compute_{arch},code=sm_{arch}");
             let mut command = Command::new(&nvcc);
             command.args(["-std=c++17", "-O3"]);
             if target_os == "windows" {
@@ -257,13 +294,14 @@ fn build_cuda_backends(target_os: &str, require_cuda: bool) {
             // be drained or a chatty nvcc deadlocks on a full buffer, so
             // each `wait_with_output` gets its own thread and this loop
             // stays free to tick.
+            for flag in &gencodes {
+                command.args(["-gencode", flag.as_str()]);
+            }
             let spawned = command
                 .args([
                     "-c",
                     "-I",
                     include_dir.to_string_lossy().as_ref(),
-                    "-gencode",
-                    arch_flag.as_str(),
                     "-o",
                     obj_path.to_string_lossy().as_ref(),
                     src_path.to_string_lossy().as_ref(),

@@ -67,6 +67,31 @@ const COMPILED_ARCH: &str = match option_env!("MAKEPAD_LLAMA_CUDA_ARCH") {
     Some(arch) => arch,
     None => "unknown",
 };
+
+/// Can a device of compute capability `cc_major.cc_minor` run kernels built
+/// for one `MAKEPAD_GGML_CUDA_ARCH` item (`86`, `120a`, `compute_120`)?
+fn arch_runs(item: &str, cc_major: i32, cc_minor: i32) -> bool {
+    let (ptx, arch) = match item.strip_prefix("compute_") {
+        Some(arch) => (true, arch),
+        None => (false, item.strip_prefix("sm_").unwrap_or(item)),
+    };
+    let specific = arch.ends_with(|c: char| c.is_ascii_alphabetic());
+    let digits = arch.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    if digits.len() < 2 {
+        return false;
+    }
+    let (major, minor) = digits.split_at(digits.len() - 1);
+    let (Ok(major), Ok(minor)) = (major.parse::<i32>(), minor.parse::<i32>()) else {
+        return false;
+    };
+    if ptx {
+        (cc_major, cc_minor) >= (major, minor)
+    } else if specific {
+        (cc_major, cc_minor) == (major, minor)
+    } else {
+        cc_major == major && cc_minor >= minor
+    }
+}
 /// Mat-vec kernels handle this many activation columns; larger M takes the
 /// slab-dequant cuBLAS GEMM path (prefill).
 ///
@@ -478,19 +503,11 @@ impl Runtime {
             let device_name = String::from_utf8_lossy(&name[..name_len]).into_owned();
 
             // SASS is compiled on the target box for that box
-            // (MAKEPAD_GGML_CUDA_ARCH=86/89/120a). Not a fat binary.
-            // Same-major, >= minor can run a given build.
-            let arch = COMPILED_ARCH.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-            let (arch_major, arch_minor) = if arch.len() >= 2 {
-                let (major, minor) = arch.split_at(arch.len() - 1);
-                (
-                    major.parse::<i32>().unwrap_or(0),
-                    minor.parse::<i32>().unwrap_or(0),
-                )
-            } else {
-                (0, 0)
-            };
-            if cc_major != arch_major || cc_minor < arch_minor {
+            // (MAKEPAD_GGML_CUDA_ARCH=86/89/120a), or a release lists
+            // several (75,80,86,89,120a,compute_120). Same-major, >= minor
+            // can run SASS (an 'a' arch only its own minor); PTX runs on its
+            // arch and anything newer.
+            if !COMPILED_ARCH.split(',').any(|item| arch_runs(item.trim(), cc_major, cc_minor)) {
                 return Err(LlamaError::unsupported(format!(
                     "CUDA device '{device_name}' is sm_{cc_major}{cc_minor}, but this build's \
                      kernels target sm_{COMPILED_ARCH}; rebuild with MAKEPAD_GGML_CUDA_ARCH={cc_major}{cc_minor}"
