@@ -2034,7 +2034,7 @@ extern "C" cudaError_t mkllm_mmq_quant(
 //
 // Fixed tile: I=128, J=128, K=256, 256 threads / 8 warps.
 // Same NVIDIA GENERIC table on 3090/4090/5090 (sm80+ m16n8k32).
-// Compiled on the target box (MAKEPAD_GGML_CUDA_ARCH); not a fat binary.
+// Built for the MAKEPAD_GGML_CUDA_ARCH list (this box's GPU by default).
 // block_q8_1_mmq is K-block-major across tokens; DS4 stores half2(d, sum)
 // where sum is the unquantized float partial (not reconstructed from q8).
 // Q4_K tile: padded stride 76, s8 nibbles + half2(d*sc, -dmin*m).
