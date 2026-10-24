@@ -479,6 +479,12 @@ pub struct PopupMenu {
     /// serves every dropdown on the same template.
     #[rust]
     pub max_height: f64,
+    /// The narrowest the menu's rows may be, in points (the menu's padding
+    /// comes on top); 0 is no floor. A dropdown sets it to its own width so
+    /// its list covers the control it opens from. Set per open, like
+    /// `max_height`.
+    #[rust]
+    pub min_width: f64,
     /// The scroll area a capped menu holds its items in.
     #[live]
     scroll_bars: ScrollBars,
@@ -675,7 +681,18 @@ impl PopupMenu {
         let size = cx.current_pass_size();
         cx.begin_root_turtle(size, Layout::flow_down());
 
-        self.draw_bg.begin(cx, self.walk, self.layout);
+        let mut walk = self.walk;
+        if self.min_width > 0.0 {
+            // The rows are the control's width; the menu's own padding goes
+            // round them, so a row placed on the control covers it edge to edge.
+            let min = self.min_width + self.layout.padding.left + self.layout.padding.right;
+            walk.width = match walk.width {
+                Size::Fixed(width) => Size::Fixed(width.max(min)),
+                Size::Fit { max, .. } => Size::Fit { min: Some(FitBound::Abs(min)), max },
+                other => other,
+            };
+        }
+        self.draw_bg.begin(cx, walk, self.layout);
         self.count = 0;
 
         // A capped menu holds its items in a scroll area no taller than the

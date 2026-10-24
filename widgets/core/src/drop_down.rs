@@ -893,6 +893,14 @@ impl DropDown {
             popup_menu.tree_parent = self.uid;
             popup_menu.icon_column = !self.icons.is_empty();
             popup_menu.max_height = self.popup_max_height;
+            // The list is at least as wide as the control it opens from.
+            let face = self.draw_bg.area().rect(cx);
+            popup_menu.min_width = self
+                .popup_anchor_transform
+                .map(|transform| transform.rect(face))
+                .unwrap_or(face)
+                .size
+                .x;
             popup_menu.begin(cx);
             popup_menu.fit_width_to_items(
                 cx,
@@ -1833,6 +1841,56 @@ mod popup_scroll_tests {
             );
         }
         chosen
+    }
+
+    /// A dropdown wider than its menu's declared width (PopupMenuFlat is
+    /// 150 points) opens a list at least as wide as itself, not a narrow
+    /// list over the left of the control.
+    #[test]
+    fn the_list_is_at_least_as_wide_as_its_dropdown() {
+        crate::on_test_cx(|| {
+            let mut cx = crate::checkout_test_cx();
+            let root = cx.with_vm(|vm| {
+                let value = crate::script_eval!(vm, {
+                    use mod.prelude.widgets.*
+                    use mod.widgets.*
+                    View{
+                        width: Fill
+                        height: Fill
+                        flow: Down
+                        padding: 40.
+                        wide := DropDown{width: 420.}
+                        narrow := DropDown{width: 100.}
+                    }
+                });
+                WidgetRef::script_from_value(vm, value)
+            });
+            for id in [ids!(wide), ids!(narrow)] {
+                root.drop_down(&mut cx, id).set_labels(&mut cx, vec!["Default output".to_string(), "Speakers".to_string()]);
+            }
+            let mut target = Target::new(&mut cx);
+            target.draw(&mut cx, &root);
+            for (id, declared) in [(ids!(wide), 420.0), (ids!(narrow), 100.0)] {
+                let pick = root.widget(&mut cx, id);
+                open(&mut cx, &root, &pick, &mut target);
+                let face = pick.borrow::<DropDown>().unwrap().draw_bg.area();
+                let face = face.rect(&mut cx);
+                let list = menu_rect(&mut cx, &pick);
+                assert!((face.size.x - declared).abs() < 0.01, "the dropdown is {} wide", face.size.x);
+                assert!(list.size.x >= face.size.x - 0.01, "a {}-point dropdown opened a {}-point list", face.size.x, list.size.x);
+                if declared > 150.0 {
+                    assert!(
+                        list.pos.x <= face.pos.x + 0.01 && list.pos.x + list.size.x >= face.pos.x + face.size.x - 0.01,
+                        "the list {list:?} does not cover the dropdown {face:?}"
+                    );
+                }
+                if declared < 150.0 {
+                    assert!((list.size.x - 150.0).abs() < 0.01, "a narrow dropdown keeps the menu's own 150 points: {}", list.size.x);
+                }
+                pick.borrow_mut::<DropDown>().unwrap().set_closed(&mut cx);
+                target.draw(&mut cx, &root);
+            }
+        });
     }
 
     /// A hundred items capped at 200 points show in a scroll area: the list
