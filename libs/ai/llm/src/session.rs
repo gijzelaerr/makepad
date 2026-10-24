@@ -2343,7 +2343,8 @@ fn sampling_probabilities(
         return Err(LlamaError::format("cannot sample from empty logits"));
     }
     let temperature = params.temperature.max(1e-6);
-    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let penalties = penalty_window(params, recent);
+    let max_logit = penalised_max(logits, penalties.as_ref());
     if !max_logit.is_finite() {
         return Err(LlamaError::format("logits contain no finite value"));
     }
@@ -2351,16 +2352,16 @@ fn sampling_probabilities(
         .iter()
         .map(|logit| ((logit - max_logit) / temperature).exp())
         .collect();
-    // The penalties fold in here as a rescale rather than as a second pass over
-    // a copied logit row: `exp((l - p - max) / T) == exp((l - max) / T) *
-    // exp(-p / T)`, exactly, so touching the handful of penalised entries is
-    // the same arithmetic as penalising the whole row would have been. Using
-    // the UNPENALISED max as the stability offset stays valid because a penalty
-    // only ever subtracts — nothing can exceed the offset and overflow.
-    if let Some(penalties) = penalty_window(params, recent) {
+    // The penalties fold in here by recomputing the handful of penalised
+    // entries rather than as a second pass over a copied logit row, so this is
+    // the same arithmetic as penalising the whole row would have been. The
+    // stability offset is the max of the PENALISED row: with the unpenalised
+    // max, a penalised top token sets an offset nothing else reaches, and at a
+    // small temperature every entry underflows to zero.
+    if let Some(penalties) = penalties {
         for (index, penalty) in penalties {
-            if let Some(value) = probs.get_mut(index) {
-                *value *= (-penalty / temperature).exp();
+            if let (Some(value), Some(logit)) = (probs.get_mut(index), logits.get(index)) {
+                *value = ((logit - penalty - max_logit) / temperature).exp();
             }
         }
     }
@@ -2511,6 +2512,26 @@ fn argmax_penalized(logits: &[f32], penalties: &BTreeMap<usize, f32>) -> Result<
     }
     let (index, _) = best.ok_or_else(|| LlamaError::format("logits contain no finite value"))?;
     i32::try_from(index).map_err(|_| LlamaError::format("sampled token does not fit in i32"))
+}
+
+/// The max of the penalised row, without materialising it: the softmax
+/// stability offset. The window's keys are sorted, so this is a plain fold
+/// over each run of untouched entries between them plus `logit - penalty` at
+/// each key — one pass, no per-entry lookup. NaN entries are skipped, as
+/// `f32::max` does.
+fn penalised_max(logits: &[f32], penalties: Option<&BTreeMap<usize, f32>>) -> f32 {
+    let plain_max = |run: &[f32]| run.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let Some(penalties) = penalties else {
+        return plain_max(logits);
+    };
+    let mut max = f32::NEG_INFINITY;
+    let mut start = 0;
+    for (&index, &penalty) in penalties.range(..logits.len()) {
+        max = max.max(plain_max(&logits[start..index]));
+        max = max.max(logits[index] - penalty);
+        start = index + 1;
+    }
+    max.max(plain_max(&logits[start..]))
 }
 
 /// Inverse-CDF draw from a normalised probability vector.
@@ -4311,10 +4332,10 @@ pub(crate) fn collapse_last_token_run(run: HybridDecodeRun) -> Result<HybridDeco
 #[cfg(test)]
 mod tests {
     use super::{
-        argmax_penalized, argmax_token_id, draft_head_fill_after, mtp_carry_ring, penalty_window,
-        sample_from, sampling_probabilities, slot_lower_bounds, slot_lower_bounds_per_token,
-        speculative_acceptance, speculative_residual, LlamaSamplerState, LlamaSamplingParams,
-        LlamaSession, SpecLane, Xorshift64,
+        argmax_penalized, argmax_token_id, draft_head_fill_after, mtp_carry_ring, penalised_max,
+        penalty_window, sample_from, sampling_probabilities, slot_lower_bounds,
+        slot_lower_bounds_per_token, speculative_acceptance, speculative_residual,
+        LlamaSamplerState, LlamaSamplingParams, LlamaSession, SpecLane, Xorshift64,
     };
 
     fn params(temperature: f32, top_p: f32, top_k: usize) -> LlamaSamplingParams {
@@ -4505,6 +4526,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A penalised top token at a tiny temperature. With the unpenalised max
+    /// (10) as the offset, token 1 is `exp(-1 / 0.001)` and token 0 is
+    /// `exp(-5 / 0.001)`: both are zero in f32 and the sampler errored with
+    /// "logit softmax underflowed to zero". The penalised row is [5, 9], so
+    /// token 1 is the near-greedy answer.
+    #[test]
+    fn a_penalised_top_token_does_not_underflow_a_cold_softmax() {
+        let logits = [10.0f32, 9.0, -3.0];
+        let penalised = LlamaSamplingParams {
+            presence_penalty: 5.0,
+            penalty_last_n: 64,
+            ..params(0.001, 1.0, 0)
+        };
+        let probs = sampling_probabilities(&logits, penalised, &[0]).unwrap();
+        assert_eq!(probs[1], 1.0, "{probs:?}");
+
+        let mut state = LlamaSamplerState::new(7);
+        assert_eq!(state.sample_logits(&logits, penalised).unwrap(), 0);
+        assert_eq!(state.sample_logits(&logits, penalised).unwrap(), 1);
+    }
+
+    /// The offset walk over the sorted window equals the obvious per-entry
+    /// max, including keys at the row's edges, a key past its end, a
+    /// negative penalty and a NaN.
+    #[test]
+    fn the_penalised_max_equals_the_penalised_row() {
+        let logits = [4.0f32, -1.0, f32::NAN, 2.5, 7.0, 0.0];
+        let penalties: std::collections::BTreeMap<usize, f32> =
+            [(0, 1.0), (4, 6.0), (5, -3.5), (99, 2.0)].into_iter().collect();
+        let by_hand = logits
+            .iter()
+            .enumerate()
+            .map(|(index, logit)| logit - penalties.get(&index).copied().unwrap_or(0.0))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(penalised_max(&logits, Some(&penalties)), by_hand);
+        assert_eq!(by_hand, 3.5);
+        assert_eq!(penalised_max(&logits, None), 7.0);
     }
 
     /// Greedy takes the same answer the penalised row would have given,
