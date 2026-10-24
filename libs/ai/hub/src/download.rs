@@ -11,6 +11,12 @@
 //!   `Range: bytes=<part-len>-` and appends. A server that ignores Range and
 //!   answers 200 causes a clean restart from zero. A 416 only completes a
 //!   `.part` whose length exactly matches its pinned manifest size.
+//! - Segmented: a large file of known size is fetched as fixed-size ranges
+//!   over several connections at once into a preallocated `.part`, with
+//!   per-segment progress in `<dest>.part.segments` for resume (see
+//!   [`segmented`]). Hugging Face's CDN caps a single connection well below
+//!   what a link can carry. A server that answers the first range with a
+//!   200 gets the single stream above.
 //! - Atomic finish: verify size/hash, rename onto the destination, then write
 //!   an atomic identity receipt. Existing files are not trusted by existence.
 //! - Gated repos (flux1-dev): `HF_TOKEN` env is sent as a bearer token, but
@@ -30,7 +36,15 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
 
+mod segmented;
+
 pub const DEFAULT_HF_BASE: &str = "https://huggingface.co";
+/// Parallel connections for one large file
+/// (`MAKEPAD_HUB_DOWNLOAD_CONNECTIONS`; 1 = always a single stream).
+pub const DEFAULT_CONNECTIONS: usize = 16;
+/// Range size each connection fetches in one request. Every request pays a
+/// fresh TLS handshake plus the Hugging Face redirect, so not too small.
+pub const DEFAULT_SEGMENT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DownloadProgress {
@@ -55,6 +69,11 @@ pub struct Downloader {
     /// In-flight peer-serve leases of this service process: delete/replace
     /// steps below refuse to touch a path while a peer transfer reads it.
     pub leases: Option<crate::peer::ServeLeases>,
+    /// Parallel range connections for a file of known size that spans at
+    /// least two segments; 1 keeps every download on a single stream.
+    pub connections: usize,
+    /// Bytes per range request on the segmented path.
+    pub segment_bytes: u64,
 }
 
 /// How long delete/replace steps wait for an in-flight peer serve of the
@@ -70,6 +89,8 @@ impl Downloader {
             token_host_suffix: parsed.host,
             peers: None,
             leases: None,
+            connections: DEFAULT_CONNECTIONS,
+            segment_bytes: DEFAULT_SEGMENT_BYTES,
         })
     }
 
@@ -97,12 +118,20 @@ impl Downloader {
     }
 
     /// hf_base from `MAKEPAD_ASSET_AI_HF_BASE` (default huggingface.co),
-    /// token from `HF_TOKEN`.
+    /// token from `HF_TOKEN`, parallel connections per large file from
+    /// `MAKEPAD_HUB_DOWNLOAD_CONNECTIONS` (default 16, 1 = single stream).
     pub fn from_env() -> Result<Self, AssetAiError> {
         let hf_base = std::env::var("MAKEPAD_ASSET_AI_HF_BASE")
             .unwrap_or_else(|_| DEFAULT_HF_BASE.to_string());
         let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
-        Self::new(&hf_base, token)
+        let mut downloader = Self::new(&hf_base, token)?;
+        if let Some(connections) = std::env::var("MAKEPAD_HUB_DOWNLOAD_CONNECTIONS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
+            downloader.connections = connections.clamp(1, 64);
+        }
+        Ok(downloader)
     }
 
     pub fn file_url(&self, file: &FileSpec) -> String {
@@ -179,6 +208,9 @@ impl Downloader {
         // runs; on any peer failure this falls straight through to the
         // canonical path below (possibly resuming the same `.part`).
         if let Some(plan) = self.peers.clone() {
+            // Peers resume from a contiguous prefix, never a preallocated
+            // segmented `.part`.
+            segmented::collapse_to_prefix(&part)?;
             if let Some(verified_sha256) = crate::peer_fetch::try_fetch_via_peers(
                 &plan,
                 file,
@@ -222,6 +254,35 @@ impl Downloader {
             )));
         }
 
+        let url = self.file_url(file);
+        let mut prefetched = None;
+        match file
+            .size
+            .filter(|&size| {
+                self.connections > 1 && file.sha256.is_some() && size >= 2 * self.segment_bytes
+            })
+        {
+            Some(size) => {
+                match segmented::fetch(self, &url, file, size, &part, progress, cancel, &artifact_lock)? {
+                    segmented::Outcome::Complete => {
+                        return self.finish_download(
+                            &url,
+                            file,
+                            &part,
+                            &dest,
+                            Some(size),
+                            progress,
+                            cancel,
+                            &artifact_lock,
+                        );
+                    }
+                    // No ranges here: that first answer is the single stream.
+                    segmented::Outcome::Single(response) => prefetched = Some(response),
+                }
+            }
+            None => segmented::collapse_to_prefix(&part)?,
+        }
+
         let mut offset = match fs::metadata(&part) {
             Ok(meta) => meta.len(),
             Err(_) => 0,
@@ -235,7 +296,6 @@ impl Downloader {
             }
         }
 
-        let url = self.file_url(file);
         let request = HttpClientRequest {
             method: "GET",
             url: &url,
@@ -248,7 +308,10 @@ impl Downloader {
             body: None,
             extra_headers: &[],
         };
-        let response = http_fetch(&request)?;
+        let response = match prefetched {
+            Some(response) => response,
+            None => http_fetch(&request)?,
+        };
 
         let mut total;
         let mut download_body = true;
@@ -346,11 +409,27 @@ impl Downloader {
                 total = Some(done);
             }
         }
+        self.finish_download(&url, file, &part, &dest, total, progress, cancel, &artifact_lock)
+    }
 
+    /// Verify a complete `.part` (sha256 and size), commit it onto `dest` and
+    /// write its receipt. A hash mismatch discards the partial.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_download(
+        &self,
+        url: &str,
+        file: &FileSpec,
+        part: &Path,
+        dest: &Path,
+        total: Option<u64>,
+        progress: &mut dyn FnMut(DownloadProgress),
+        cancel: &CancelToken,
+        artifact_lock: &ArtifactLock,
+    ) -> Result<PathBuf, AssetAiError> {
         let actual_sha256 = if let Some(expected) = &file.sha256 {
-            let actual = hash_file_with_heartbeat(&part, cancel, &artifact_lock)?;
+            let actual = hash_file_with_heartbeat(part, cancel, artifact_lock)?;
             if actual != *expected {
-                let _ = fs::remove_file(&part);
+                let _ = fs::remove_file(part);
                 return Err(AssetAiError::Download(format!(
                     "{url}: sha256 mismatch: expected {expected}, got {actual} (partial file discarded)"
                 )));
@@ -359,7 +438,7 @@ impl Downloader {
         } else {
             None
         };
-        let part_len = fs::metadata(&part)
+        let part_len = fs::metadata(part)
             .map_err(|e| AssetAiError::Download(format!("metadata {}: {e}", part.display())))?
             .len();
         if let Some(expected) = file.size {
@@ -371,15 +450,15 @@ impl Downloader {
         }
         cancel.check()?;
 
-        self.commit_part_to_dest(&part, &dest)?;
-        write_source_receipt(file, &dest, actual_sha256.as_deref())?;
-        let final_len = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        self.commit_part_to_dest(part, dest)?;
+        write_source_receipt(file, dest, actual_sha256.as_deref())?;
+        let final_len = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
         progress(DownloadProgress {
             file: file.path.clone(),
             done: final_len,
             total: total.or(Some(final_len)),
         });
-        Ok(dest)
+        Ok(dest.to_path_buf())
     }
 
     /// Atomic-enough finish shared by the peer and Hugging Face paths:
